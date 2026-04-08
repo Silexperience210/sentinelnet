@@ -1,0 +1,29 @@
+[sentinel]
+name = "SentinelNet-Silex-1"
+data_dir = "./sentinel_data"
+api_port = 9000
+advertised_addr = "YOUR_IP:9001"
+
+[bitcoin]
+rpc_url = "http://127.0.0.1:8332"
+rpc_user = "bitcoinrpc"
+rpc_password = "your_rpc_password"
+poll_interval_secs = 5
+cltv_safe_margin = 144  # ~1 day before expiry
+
+[lnd]
+rest_url = "https://localhost:8080"
+tls_cert_path = "~/.lnd/tls.cert"
+macaroon_hex = "YOUR_ADMIN_MACAROON_HEX"
+node_pubkey = "YOUR_LND_NODE_PUBKEY"
+
+[gossip]
+port = 9001
+peers = []  # Add other sentinel addresses: ["192.168.1.2:9001", "192.168.1.3:9001"]
+broadcast_interval_secs = 30
+
+[defense]
+fee_multiplier = 1.5          # Multiply mempool median fee by this for bumping
+min_bounty_sats = 500         # Minimum bounty per defense
+max_bounty_sats = 50000       # Cap on bounty (satoshis)
+availability_fee_sats_per_hour = 2  # Passive fee per HTLC watched

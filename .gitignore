@@ -1,0 +1,4 @@
+/target
+sentinel_data/
+*.toml.local
+.env
