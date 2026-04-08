@@ -14,6 +14,7 @@ use clap::{Parser, Subcommand};
 use std::fs;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -61,17 +62,19 @@ async fn main() -> Result<()> {
         Commands::Watch { txid, vout, claim_tx, pubkey, cltv, amount } => {
             let cfg = config::Config::load(&cli.config)?;
             let store = store::HtlcStore::open(&cfg.sentinel.data_dir)?;
-            store.register(&store::WatchedHtlc::new(txid.clone(), vout, vec![claim_tx], pubkey, cltv, amount))?;
+            store.register(&store::WatchedHtlc::new(
+                txid.clone(), vout, vec![claim_tx], pubkey, cltv, amount,
+            ))?;
             println!("✅ Registered HTLC {txid}");
             return Ok(());
         }
         Commands::Start => {}
     }
 
-    let cfg = config::Config::load(&cli.config)?;
+    let cfg = config::Config::load(&cli.config)
+        .with_context(|| format!("Failed to load config from {}", cli.config))?;
     fs::create_dir_all(&cfg.sentinel.data_dir)?;
 
-    // Warn on default secrets
     if cfg.sentinel.api_key.contains("CHANGE_ME") {
         warn!("⚠️  API key is default — set sentinel.api_key in config.toml!");
     }
@@ -85,70 +88,94 @@ async fn main() -> Result<()> {
     info!("╚══════════════════════════════════════════╝");
     info!("Node:   {}", cfg.sentinel.name);
     info!("API:    http://0.0.0.0:{} (auth: {})", cfg.sentinel.api_port,
-        if cfg.sentinel.api_key.is_empty() { "disabled" } else { "X-Sentinel-Key" });
+        if cfg.sentinel.api_key.is_empty() { "disabled ⚠️" } else { "X-Sentinel-Key ✅" });
     info!("Gossip: 0.0.0.0:{} | {} peers | HMAC: {}",
         cfg.gossip.port, cfg.gossip.peers.len(),
-        if cfg.gossip.shared_secret.contains("CHANGE_ME") { "⚠️ default" } else { "✅ custom" });
+        if cfg.gossip.shared_secret.contains("CHANGE_ME") { "default ⚠️" } else { "custom ✅" });
 
     let store = store::HtlcStore::open(&cfg.sentinel.data_dir)?;
     let stats = store.stats()?;
     info!("Store: {} HTLCs | {} defended | {} bounties pending",
         stats.total, stats.defended, stats.bounties_pending);
 
-    // Shared Bitcoin RPC client
     let rpc = Arc::new(BtcClient::new(
         &cfg.bitcoin.rpc_url,
         Auth::UserPass(cfg.bitcoin.rpc_user.clone(), cfg.bitcoin.rpc_password.clone()),
     )?);
 
-    // LND client
     let lnd_client = lnd::LndClient::new(&cfg.lnd)?;
     match lnd_client.get_info().await {
         Ok(info) => {
             info!("LND: {} ({})", info.alias, &info.identity_pubkey[..16]);
-            if !info.synced_to_chain { warn!("⚠️  LND not synced"); }
+            if !info.synced_to_chain { warn!("⚠️  LND not synced to chain"); }
         }
-        Err(e) => warn!("⚠️  LND unreachable: {e}"),
+        Err(e) => warn!("⚠️  LND unreachable: {e} — bounty payments disabled"),
     }
 
-    // Channels
+    // ── Graceful shutdown token ──────────────────────────────────────────────
+    let cancel = CancellationToken::new();
+
+    // ── Channels ─────────────────────────────────────────────────────────────
     let (mempool_tx, mempool_rx) = mpsc::channel::<watcher::MempoolEvent>(1024);
     let (defense_tx, defense_rx) = mpsc::channel::<defense::DefenseResult>(256);
-    let (gossip_bcast_tx, _) = broadcast::channel::<gossip::GossipMessage>(256);
-    let gossip_rx_client = gossip_bcast_tx.subscribe();
+    let (gossip_bcast, _) = broadcast::channel::<gossip::GossipMessage>(256);
+    let gossip_rx_client = gossip_bcast.subscribe();
 
-    // Tasks
+    // ── Task helpers ─────────────────────────────────────────────────────────
+    macro_rules! spawn_cancellable {
+        ($name:expr, $cancel:expr, $fut:expr) => {{
+            let c = $cancel.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    res = $fut => {
+                        if let Err(e) = res { error!("{} crashed: {e}", $name); }
+                    }
+                    _ = c.cancelled() => {
+                        info!("{} shutting down gracefully", $name);
+                    }
+                }
+            })
+        }};
+    }
+
+    // Task 1 — Mempool watcher
     let t1 = {
-        let w = watcher::MempoolWatcher::new(cfg.bitcoin.clone(), store.clone(), mempool_tx)?;
-        tokio::spawn(async move { if let Err(e) = w.run().await { error!("Watcher: {e}"); } })
+        let w = watcher::MempoolWatcher::new(
+            cfg.bitcoin.clone(), store.clone(), mempool_tx,
+        )?;
+        spawn_cancellable!("Watcher", cancel, async move { w.run().await })
     };
 
+    // Task 2 — Defense engine
     let t2 = {
         let mut engine = defense::DefenseEngine::new(
             cfg.bitcoin.clone(), cfg.defense.clone(),
             store.clone(), mempool_rx, defense_tx,
         )?;
-        tokio::spawn(async move { if let Err(e) = engine.run().await { error!("Defense: {e}"); } })
+        spawn_cancellable!("Defense", cancel, async move { engine.run().await })
     };
 
+    // Task 3 — Bounty processor
     let t3 = {
         let mut bp = bounty::BountyProcessor::new(
             cfg.defense.clone(), store.clone(), lnd_client,
             rpc.clone(), defense_rx, cfg.lnd.node_pubkey.clone(),
         );
-        tokio::spawn(async move { if let Err(e) = bp.run().await { error!("Bounty: {e}"); } })
+        spawn_cancellable!("Bounty", cancel, async move { bp.run().await })
     };
 
+    // Task 4 — Gossip server
     let t4 = {
         let server = gossip::GossipServer::new(
             cfg.gossip.port, store.clone(),
             cfg.lnd.node_pubkey.clone(),
             cfg.gossip.shared_secret.clone(),
-            gossip_bcast_tx.clone(),
+            gossip_bcast.clone(),
         );
-        tokio::spawn(async move { if let Err(e) = server.run().await { error!("GossipServer: {e}"); } })
+        spawn_cancellable!("GossipServer", cancel, async move { server.run().await })
     };
 
+    // Task 5 — Gossip client
     let t5 = {
         let client = gossip::GossipClient::new(
             cfg.gossip.peers.clone(),
@@ -159,24 +186,32 @@ async fn main() -> Result<()> {
             cfg.gossip.broadcast_interval_secs,
             gossip_rx_client,
         );
-        tokio::spawn(async move { if let Err(e) = client.run().await { error!("GossipClient: {e}"); } })
+        spawn_cancellable!("GossipClient", cancel, async move { client.run().await })
     };
 
+    // Task 6 — API server
     let t6 = {
-        let server = api::ApiServer::new(cfg.sentinel.api_port, store.clone(), cfg.sentinel.api_key.clone());
-        tokio::spawn(async move { if let Err(e) = server.run().await { error!("API: {e}"); } })
+        let server = api::ApiServer::new(
+            cfg.sentinel.api_port, store.clone(), cfg.sentinel.api_key.clone(),
+        );
+        spawn_cancellable!("API", cancel, async move { server.run().await })
     };
 
-    info!("🟢 SentinelNet online — POST http://0.0.0.0:{}/register", cfg.sentinel.api_port);
+    info!("🟢 SentinelNet online");
+    info!("   POST http://0.0.0.0:{}/register  (X-Sentinel-Key: <key>)", cfg.sentinel.api_port);
+    info!("   GET  http://0.0.0.0:{}/status", cfg.sentinel.api_port);
 
-    tokio::select! {
-        _ = t1 => error!("Watcher exited"),
-        _ = t2 => error!("Defense exited"),
-        _ = t3 => error!("Bounty exited"),
-        _ = t4 => error!("GossipServer exited"),
-        _ = t5 => error!("GossipClient exited"),
-        _ = t6 => error!("API exited"),
-        _ = tokio::signal::ctrl_c() => info!("Shutting down"),
-    }
+    // ── Wait for Ctrl-C, then cancel all tasks ───────────────────────────────
+    tokio::signal::ctrl_c().await?;
+    info!("Ctrl-C received — shutting down all tasks…");
+    cancel.cancel();
+
+    // Give tasks 5 s to finish gracefully
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        async { let _ = tokio::join!(t1, t2, t3, t4, t5, t6); },
+    ).await.ok();
+
+    info!("✅ Clean shutdown");
     Ok(())
 }

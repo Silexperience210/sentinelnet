@@ -1,12 +1,3 @@
-/// sentinel-client
-///
-/// Runs on the PROTECTED node side.
-/// 1. Connects to local LND (REST)
-/// 2. Scans active channels for pending HTLCs
-/// 3. Pre-signs claim transactions at N fee tiers
-/// 4. Registers them with one or more SentinelNet nodes
-/// 5. Runs in watch-loop, re-registering on channel updates
-
 mod htlc_builder;
 mod lnd;
 mod register;
@@ -17,39 +8,9 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use tokio::time::{interval, Duration};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
-
-// ─── CLI ─────────────────────────────────────────────────────────────────────
-
-#[derive(Parser)]
-#[command(
-    name = "sentinel-client",
-    about = "SentinelNet Client — registers your HTLCs with sentinel nodes",
-    version = "0.1.0"
-)]
-struct Cli {
-    #[arg(short, long, default_value = "client.toml")]
-    config: String,
-
-    #[command(subcommand)]
-    command: Option<Commands>,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Start the registration daemon (watches for new HTLCs continuously)
-    Watch,
-    /// One-shot: register all current HTLCs then exit
-    Register,
-    /// Generate default client config
-    Init {
-        #[arg(short, long, default_value = "client.toml")]
-        output: String,
-    },
-    /// Show registration status
-    Status,
-}
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -66,32 +27,33 @@ pub struct LndConfig {
     pub rest_url: String,
     pub tls_cert_path: String,
     pub macaroon_hex: String,
-    /// This node's pubkey (for keysend bounty receipt)
     pub node_pubkey: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SentinelEndpoint {
     pub name: String,
-    pub url: String, // e.g. http://192.168.1.10:9000
+    pub url: String,
+    /// API key for this sentinel's protected endpoints
+    pub api_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeeConfig {
-    /// Base fee rate for claim tx (sat/vbyte)
+    /// Base fee rate (sat/vbyte) — overridden by LND estimate if available
     pub base_fee_rate: f64,
-    /// Fee tiers as multipliers of base (e.g. [1.0, 2.0, 5.0, 10.0])
+    /// Fee tier multipliers: [1.0, 2.0, 5.0, 10.0] = 4 pre-signed txs per HTLC
     pub fee_tiers: Vec<f64>,
-    /// CLTV safety margin: how many blocks before expiry to pre-sign
     pub cltv_margin: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WatchConfig {
-    /// How often to scan for new HTLCs (seconds)
     pub scan_interval_secs: u64,
-    /// Re-register HTLCs this many blocks before CLTV expiry
+    /// Blocks before CLTV at which we force-re-register with latest fee tiers
     pub reregister_margin: u32,
+    /// Also scan force-closing channels (Mode B — accurate outpoints)
+    pub scan_force_closing: bool,
 }
 
 impl Default for ClientConfig {
@@ -103,23 +65,49 @@ impl Default for ClientConfig {
                 macaroon_hex: String::new(),
                 node_pubkey: String::new(),
             },
-            sentinels: vec![
-                SentinelEndpoint {
-                    name: "primary".to_string(),
-                    url: "http://127.0.0.1:9000".to_string(),
-                },
-            ],
+            sentinels: vec![SentinelEndpoint {
+                name: "primary".to_string(),
+                url: "http://127.0.0.1:9000".to_string(),
+                api_key: "CHANGE_ME".to_string(),
+            }],
             fees: FeeConfig {
                 base_fee_rate: 10.0,
                 fee_tiers: vec![1.0, 2.0, 5.0, 10.0],
-                cltv_margin: 288, // 2 days
+                cltv_margin: 288,
             },
             watch: WatchConfig {
                 scan_interval_secs: 30,
                 reregister_margin: 50,
+                scan_force_closing: true,
             },
         }
     }
+}
+
+// ─── CLI ─────────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+#[command(name = "sentinel-client", about = "SentinelNet Client — registers HTLCs with sentinels", version = "0.1.0")]
+struct Cli {
+    #[arg(short, long, default_value = "client.toml")]
+    config: String,
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Watch continuously — re-registers on channel changes
+    Watch,
+    /// Register all current HTLCs once and exit
+    Register,
+    /// Generate default config file
+    Init {
+        #[arg(short, long, default_value = "client.toml")]
+        output: String,
+    },
+    /// Show sentinel status pages
+    Status,
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -134,25 +122,45 @@ async fn main() -> Result<()> {
 
     match cli.command.unwrap_or(Commands::Watch) {
         Commands::Init { output } => {
-            let cfg = ClientConfig::default();
-            let toml_str = toml::to_string_pretty(&cfg)?;
-            fs::write(&output, &toml_str)?;
-            println!("✅ Default client config written to {output}");
+            fs::write(&output, toml::to_string_pretty(&ClientConfig::default())?)?;
+            println!("✅ Client config written to {output}");
             return Ok(());
         }
         Commands::Status => {
-            println!("Use: curl http://localhost:9000/htlcs");
+            let cfg = load_config(&cli.config)?;
+            for s in &cfg.sentinels {
+                match register::check_sentinel_status(&s.url).await {
+                    Ok(v) => println!("[{}] {}", s.name, serde_json::to_string_pretty(&v)?),
+                    Err(e) => println!("[{}] ❌ {e}", s.name),
+                }
+            }
             return Ok(());
         }
         Commands::Register => {
             let cfg = load_config(&cli.config)?;
             let lnd = lnd::LndRestClient::new(&cfg.lnd)?;
-            run_once(&cfg, &lnd).await?;
+            let n = scan_and_register(&cfg, &lnd).await?;
+            info!("Registered {n} HTLCs");
         }
         Commands::Watch => {
             let cfg = load_config(&cli.config)?;
             let lnd = lnd::LndRestClient::new(&cfg.lnd)?;
-            run_watch_loop(&cfg, &lnd).await?;
+
+            // Verify LND connectivity
+            match lnd.get_info().await {
+                Ok(info) => info!("LND: {} | block {}", info.alias, info.block_height),
+                Err(e) => warn!("LND unreachable: {e}"),
+            }
+
+            let cancel = CancellationToken::new();
+            let c2 = cancel.clone();
+            tokio::spawn(async move {
+                tokio::signal::ctrl_c().await.ok();
+                info!("Shutting down client…");
+                c2.cancel();
+            });
+
+            run_watch_loop(&cfg, &lnd, cancel).await?;
         }
     }
 
@@ -160,91 +168,93 @@ async fn main() -> Result<()> {
 }
 
 fn load_config(path: &str) -> Result<ClientConfig> {
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("Cannot read client config: {path}"))?;
-    toml::from_str(&contents).context("Failed to parse client config")
+    let s = fs::read_to_string(path)
+        .with_context(|| format!("Cannot read {path}"))?;
+    toml::from_str(&s).context("Failed to parse client config")
 }
 
-/// One-shot: scan + register all HTLCs
-async fn run_once(cfg: &ClientConfig, lnd: &lnd::LndRestClient) -> Result<()> {
-    info!("Scanning LND for pending HTLCs...");
-    let htlcs = scan_and_register(cfg, lnd).await?;
-    info!("Registered {} HTLCs with {} sentinels", htlcs, cfg.sentinels.len());
-    Ok(())
-}
-
-/// Continuous watch loop
-async fn run_watch_loop(cfg: &ClientConfig, lnd: &lnd::LndRestClient) -> Result<()> {
-    info!("SentinelNet Client — watch loop started");
-    info!("Scanning every {}s across {} sentinels",
+async fn run_watch_loop(
+    cfg: &ClientConfig,
+    lnd: &lnd::LndRestClient,
+    cancel: CancellationToken,
+) -> Result<()> {
+    info!("Watch loop started — scan every {}s | {} sentinels",
         cfg.watch.scan_interval_secs, cfg.sentinels.len());
-
     let mut ticker = interval(Duration::from_secs(cfg.watch.scan_interval_secs));
 
     loop {
-        ticker.tick().await;
-        match scan_and_register(cfg, lnd).await {
-            Ok(count) => {
-                if count > 0 {
-                    info!("Registered/refreshed {count} HTLCs");
+        tokio::select! {
+            _ = ticker.tick() => {
+                match scan_and_register(cfg, lnd).await {
+                    Ok(n) if n > 0 => info!("Registered/refreshed {n} HTLCs"),
+                    Ok(_) => {},
+                    Err(e) => error!("Scan error: {e}"),
                 }
             }
-            Err(e) => error!("Scan error: {e}"),
+            _ = cancel.cancelled() => break,
         }
     }
+    Ok(())
 }
 
-/// Core logic: scan LND, build claim txs, register with sentinels
+/// Scan LND for HTLCs and register them with all configured sentinels.
+/// Handles both Mode A (active channels) and Mode B (force-closing).
 async fn scan_and_register(cfg: &ClientConfig, lnd: &lnd::LndRestClient) -> Result<usize> {
-    // 1. Get all channels with pending HTLCs
-    let channels = lnd.list_channels_with_htlcs().await?;
-    let mut registered = 0;
+    let mut all_channels = lnd.list_channels_with_htlcs().await?;
 
-    for channel in &channels {
+    // Mode B: also include force-closing channels (real outpoints)
+    if cfg.watch.scan_force_closing {
+        let force_close = lnd.list_force_close_htlcs().await.unwrap_or_default();
+        if !force_close.is_empty() {
+            info!("⚠️  {} force-closing channels detected — registering with real outpoints",
+                force_close.len());
+            all_channels.extend(force_close);
+        }
+    }
+
+    let mut registered = 0;
+    for channel in &all_channels {
         for htlc in &channel.pending_htlcs {
-            // Only care about incoming HTLCs (we are the potential victim)
-            if !htlc.incoming {
-                continue;
+            if !htlc.incoming { continue; } // Only protect incoming HTLCs
+
+            if !channel.outpoints_confirmed {
+                warn!("HTLC {} uses placeholder outpoints (active channel — will update on close)",
+                    &htlc.hash_lock[..16.min(htlc.hash_lock.len())]);
             }
 
-            // Build pre-signed claim transactions at each fee tier
             let claim_txs = match htlc_builder::build_claim_txs(
-                &channel.channel_point,
-                htlc,
-                &cfg.fees,
-                lnd,
+                &channel.channel_point, htlc, &cfg.fees, lnd,
             ).await {
                 Ok(txs) => txs,
                 Err(e) => {
-                    warn!("Failed to build claim txs for HTLC {}: {e}", htlc.hash_lock);
+                    warn!("Failed to build claim txs for {}: {e}",
+                        &htlc.hash_lock[..16.min(htlc.hash_lock.len())]);
                     continue;
                 }
             };
 
-            // Register with all configured sentinels
             let payload = register::RegistrationPayload {
-                txid: htlc.outpoint_txid.clone(),
-                vout: htlc.outpoint_index,
+                txid:                   htlc.outpoint_txid.clone(),
+                vout:                   htlc.outpoint_index,
                 claim_txs,
-                protected_node_pubkey: cfg.lnd.node_pubkey.clone(),
-                cltv_expiry: htlc.expiration_height,
-                amount_sats: htlc.amount_msat / 1000,
+                protected_node_pubkey:  cfg.lnd.node_pubkey.clone(),
+                cltv_expiry:            htlc.expiration_height,
+                amount_sats:            htlc.amount_sats,
             };
 
             for sentinel in &cfg.sentinels {
-                match register::register_htlc(&sentinel.url, &payload).await {
+                match register::register_htlc(&sentinel.url, &payload, &sentinel.api_key).await {
                     Ok(_) => {
-                        info!("✅ HTLC {} registered with sentinel [{}]",
-                            &htlc.hash_lock[..16], sentinel.name);
+                        info!("✅ {} → sentinel [{}] ({})",
+                            &htlc.hash_lock[..16.min(htlc.hash_lock.len())],
+                            sentinel.name,
+                            if channel.outpoints_confirmed { "confirmed" } else { "placeholder" });
                         registered += 1;
                     }
-                    Err(e) => {
-                        warn!("Failed to register with sentinel [{}]: {e}", sentinel.name);
-                    }
+                    Err(e) => warn!("Failed to register with [{}]: {e}", sentinel.name),
                 }
             }
         }
     }
-
     Ok(registered)
 }

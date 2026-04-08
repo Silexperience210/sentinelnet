@@ -1,0 +1,35 @@
+# sentinel-client configuration (runs on the PROTECTED NODE alongside LND)
+
+[lnd]
+rest_url        = "https://localhost:8080"
+tls_cert_path   = "~/.lnd/tls.cert"
+macaroon_hex    = "YOUR_ADMIN_MACAROON_HEX"
+node_pubkey     = "YOUR_LND_NODE_PUBKEY_HEX"
+
+# One or more sentinel nodes to register with
+# Using multiple sentinels provides redundancy
+[[sentinels]]
+name    = "primary"
+url     = "http://YOUR_SENTINEL_IP:9000"
+api_key = "SAME_AS_sentinel_api_key_in_sentinel_config_toml"
+
+# [[sentinels]]
+# name    = "backup"
+# url     = "http://ANOTHER_SENTINEL_IP:9000"
+# api_key = "THAT_SENTINELS_API_KEY"
+
+[fees]
+# Starting fee rate (sat/vbyte) — overridden by LND estimate when available
+base_fee_rate = 10.0
+# Four pre-signed versions: base, 2x, 5x, 10x
+fee_tiers     = [1.0, 2.0, 5.0, 10.0]
+# Register HTLCs when this many blocks remain before CLTV expiry
+cltv_margin   = 288
+
+[watch]
+# How often to scan LND for new/changed HTLCs (seconds)
+scan_interval_secs  = 30
+# Re-register when fewer than this many blocks remain (to refresh fee tiers)
+reregister_margin   = 50
+# Also watch force-closing channels (Mode B — accurate outpoints)
+scan_force_closing  = true

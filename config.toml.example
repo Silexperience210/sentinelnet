@@ -1,29 +1,44 @@
+# SentinelNet configuration
+# Generate secrets: openssl rand -hex 32
+
 [sentinel]
-name = "SentinelNet-Silex-1"
-data_dir = "./sentinel_data"
-api_port = 9000
-advertised_addr = "YOUR_IP:9001"
+name            = "SentinelNet-Silex-1"
+data_dir        = "./sentinel_data"
+api_port        = 9000
+advertised_addr = "YOUR_PUBLIC_IP:9001"
+# Protect write endpoints — share this with sentinel-client operators
+# Generate: openssl rand -hex 32
+api_key         = "CHANGE_ME_openssl_rand_hex_32"
 
 [bitcoin]
-rpc_url = "http://127.0.0.1:8332"
-rpc_user = "bitcoinrpc"
-rpc_password = "your_rpc_password"
-poll_interval_secs = 5
-cltv_safe_margin = 144  # ~1 day before expiry
+# Bitcoin Knots or Core RPC
+rpc_url             = "http://127.0.0.1:8332"
+rpc_user            = "bitcoinrpc"
+rpc_password        = "YOUR_RPC_PASSWORD"
+poll_interval_secs  = 5
+# Trigger defense N blocks before CLTV expiry (~1 day = 144)
+cltv_safe_margin    = 144
 
 [lnd]
-rest_url = "https://localhost:8080"
-tls_cert_path = "~/.lnd/tls.cert"
-macaroon_hex = "YOUR_ADMIN_MACAROON_HEX"
-node_pubkey = "YOUR_LND_NODE_PUBKEY"
+rest_url        = "https://localhost:8080"
+tls_cert_path   = "~/.lnd/tls.cert"
+# Get macaroon: xxd -p -c 256 ~/.lnd/data/chain/bitcoin/mainnet/admin.macaroon
+macaroon_hex    = "YOUR_ADMIN_MACAROON_HEX"
+# Get pubkey: lncli getinfo | grep identity_pubkey
+node_pubkey     = "YOUR_LND_NODE_PUBKEY_HEX"
 
 [gossip]
-port = 9001
-peers = []  # Add other sentinel addresses: ["192.168.1.2:9001", "192.168.1.3:9001"]
+port                    = 9001
+# Other sentinel nodes in your mesh (host:gossip_port)
+peers                   = []
+# Example: peers = ["192.168.1.2:9001", "sentinel2.example.com:9001"]
 broadcast_interval_secs = 30
+# Shared HMAC secret — ALL sentinels in the same mesh must use the same value
+# Generate: openssl rand -hex 32
+shared_secret           = "CHANGE_ME_openssl_rand_hex_32"
 
 [defense]
-fee_multiplier = 1.5          # Multiply mempool median fee by this for bumping
-min_bounty_sats = 500         # Minimum bounty per defense
-max_bounty_sats = 50000       # Cap on bounty (satoshis)
-availability_fee_sats_per_hour = 2  # Passive fee per HTLC watched
+fee_multiplier                  = 1.5
+min_bounty_sats                 = 500
+max_bounty_sats                 = 50000
+availability_fee_sats_per_hour  = 2

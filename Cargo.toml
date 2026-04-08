@@ -19,6 +19,7 @@ shellexpand = "3"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
 
 # Error handling
 anyhow = "1"
