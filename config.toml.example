@@ -1,39 +1,37 @@
-# SentinelNet configuration
+# SentinelNet v0.1.0 — Sentinel daemon configuration
 # Generate secrets: openssl rand -hex 32
 
 [sentinel]
-name            = "SentinelNet-Silex-1"
+name            = "SentinelNet-Node-1"
 data_dir        = "./sentinel_data"
 api_port        = 9000
 advertised_addr = "YOUR_PUBLIC_IP:9001"
-# Protect write endpoints — share this with sentinel-client operators
+# Protects POST /register and GET /htlcs — share with sentinel-client operators
 # Generate: openssl rand -hex 32
 api_key         = "CHANGE_ME_openssl_rand_hex_32"
 
 [bitcoin]
-# Bitcoin Knots or Core RPC
-rpc_url             = "http://127.0.0.1:8332"
-rpc_user            = "bitcoinrpc"
-rpc_password        = "YOUR_RPC_PASSWORD"
-poll_interval_secs  = 5
-# Trigger defense N blocks before CLTV expiry (~1 day = 144)
-cltv_safe_margin    = 144
+rpc_url              = "http://127.0.0.1:8332"
+rpc_user             = "bitcoinrpc"
+rpc_password         = "YOUR_RPC_PASSWORD"
+poll_interval_secs   = 5
+cltv_safe_margin     = 144   # blocks before CLTV expiry to trigger defense (~1 day)
+fee_bump_after_blocks = 6    # blocks before CPFP fee-bump of stuck defense tx
 
 [lnd]
 rest_url        = "https://localhost:8080"
 tls_cert_path   = "~/.lnd/tls.cert"
 # Get macaroon: xxd -p -c 256 ~/.lnd/data/chain/bitcoin/mainnet/admin.macaroon
 macaroon_hex    = "YOUR_ADMIN_MACAROON_HEX"
-# Get pubkey: lncli getinfo | grep identity_pubkey
+# Get pubkey:   lncli getinfo | grep identity_pubkey
 node_pubkey     = "YOUR_LND_NODE_PUBKEY_HEX"
 
 [gossip]
 port                    = 9001
-# Other sentinel nodes in your mesh (host:gossip_port)
+# Other sentinels: ["192.168.1.2:9001", "sentinel2.example.com:9001"]
 peers                   = []
-# Example: peers = ["192.168.1.2:9001", "sentinel2.example.com:9001"]
 broadcast_interval_secs = 30
-# Shared HMAC secret — ALL sentinels in the same mesh must use the same value
+# All sentinels in the same mesh MUST share this secret
 # Generate: openssl rand -hex 32
 shared_secret           = "CHANGE_ME_openssl_rand_hex_32"
 
@@ -42,3 +40,9 @@ fee_multiplier                  = 1.5
 min_bounty_sats                 = 500
 max_bounty_sats                 = 50000
 availability_fee_sats_per_hour  = 2
+
+[storage]
+# Encrypt all DB values at rest using AES-256-GCM (key derived from api_key)
+encrypt_db            = false
+# Backup interval in seconds (0 = disabled). Keeps last 10 backups.
+backup_interval_secs  = 3600

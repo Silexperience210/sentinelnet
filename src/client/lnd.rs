@@ -413,6 +413,28 @@ impl LndRestClient {
         }
         anyhow::bail!("No signed_transaction in LND response: {resp:?}")
     }
+    // ─── Fix 2: real local HTLC base key ────────────────────────────────────
+
+    /// Returns the 33-byte compressed local HTLC base public key (key family 2, index 0).
+    /// This is the real key from LND — not a placeholder.
+    /// The remote HTLC key still requires gRPC GetChanInfo in production.
+    pub async fn get_htlc_base_key(&self) -> Result<Vec<u8>> {
+        let (hk, hv) = self.mac();
+        let body = serde_json::json!({
+            "key_loc": { "key_family": 2, "key_index": 0 }
+        });
+        let resp: serde_json::Value = self.client
+            .post(format!("{}/v2/wallet/key", self.base_url))
+            .header(hk, hv).json(&body).send().await?
+            .json().await?;
+
+        if let Some(b64) = resp["raw_key_bytes"].as_str() {
+            use base64::{engine::general_purpose::STANDARD as B64, Engine};
+            let bytes = B64.decode(b64)?;
+            if bytes.len() == 33 { return Ok(bytes); }
+        }
+        anyhow::bail!("No raw_key_bytes in /v2/wallet/key response: {resp:?}")
+    }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

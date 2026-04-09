@@ -1,12 +1,5 @@
-mod api;
-mod bounty;
-mod config;
-mod defense;
-mod gossip;
-mod lnd;
-mod proof;
-mod store;
-mod watcher;
+mod api; mod backup; mod bounty; mod config; mod defense; mod fee_bump;
+mod gossip; mod lnd; mod metrics; mod proof; mod rate_limit; mod store; mod watcher;
 
 use anyhow::{Context, Result};
 use bitcoincore_rpc::{Auth, Client as BtcClient};
@@ -19,28 +12,20 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
 #[derive(Parser)]
-#[command(name = "sentinel", about = "SentinelNet — Incentivized Lightning Network Watchtower", version = "0.1.0")]
+#[command(name="sentinel", about="SentinelNet — Incentivized Lightning Network Watchtower", version="0.1.0")]
 struct Cli {
-    #[arg(short, long, default_value = "config.toml")]
-    config: String,
-    #[command(subcommand)]
-    command: Option<Commands>,
+    #[arg(short, long, default_value="config.toml")] config: String,
+    #[command(subcommand)] command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
     Start,
-    Init {
-        #[arg(short, long, default_value = "config.toml")]
-        output: String,
-    },
+    Init { #[arg(short,long,default_value="config.toml")] output: String },
     Watch {
-        #[arg(long)] txid: String,
-        #[arg(long, default_value = "0")] vout: u32,
-        #[arg(long)] claim_tx: String,
-        #[arg(long)] pubkey: String,
-        #[arg(long)] cltv: u32,
-        #[arg(long)] amount: u64,
+        #[arg(long)] txid: String, #[arg(long,default_value="0")] vout: u32,
+        #[arg(long)] claim_tx: String, #[arg(long)] pubkey: String,
+        #[arg(long)] cltv: u32, #[arg(long)] amount: u64,
     },
 }
 
@@ -50,51 +35,44 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| EnvFilter::new("sentinelnet=info,warn"));
     fmt().with_env_filter(filter).with_target(false).compact().init();
 
-    let cli = Cli::parse();
+    // Init Prometheus metrics registry early
+    metrics::init();
 
+    let cli = Cli::parse();
     match cli.command.unwrap_or(Commands::Start) {
         Commands::Init { output } => {
             fs::write(&output, toml::to_string_pretty(&config::Config::default())?)?;
-            println!("✅ Config written to {output}");
-            println!("   Generate secrets: openssl rand -hex 32");
+            println!("✅ {output}  — generate secrets: openssl rand -hex 32");
             return Ok(());
         }
         Commands::Watch { txid, vout, claim_tx, pubkey, cltv, amount } => {
             let cfg = config::Config::load(&cli.config)?;
-            let store = store::HtlcStore::open(&cfg.sentinel.data_dir)?;
-            store.register(&store::WatchedHtlc::new(
-                txid.clone(), vout, vec![claim_tx], pubkey, cltv, amount,
-            ))?;
-            println!("✅ Registered HTLC {txid}");
+            let store = store::HtlcStore::open(&cfg.sentinel.data_dir, cfg.encryption_secret().as_deref())?;
+            store.register(&store::WatchedHtlc::new(txid.clone(),vout,vec![claim_tx],pubkey,cltv,amount))?;
+            println!("✅ {txid}");
             return Ok(());
         }
         Commands::Start => {}
     }
 
     let cfg = config::Config::load(&cli.config)
-        .with_context(|| format!("Failed to load config from {}", cli.config))?;
+        .with_context(|| format!("Config: {}", cli.config))?;
     fs::create_dir_all(&cfg.sentinel.data_dir)?;
 
-    if cfg.sentinel.api_key.contains("CHANGE_ME") {
-        warn!("⚠️  API key is default — set sentinel.api_key in config.toml!");
-    }
-    if cfg.gossip.shared_secret.contains("CHANGE_ME") {
-        warn!("⚠️  Gossip secret is default — set gossip.shared_secret in config.toml!");
-    }
+    if cfg.sentinel.api_key.contains("CHANGE_ME") { warn!("⚠️  api_key is default!"); }
+    if cfg.gossip.shared_secret.contains("CHANGE_ME") { warn!("⚠️  gossip.shared_secret is default!"); }
 
     info!("╔══════════════════════════════════════════╗");
     info!("║          SentinelNet v0.1.0               ║");
     info!("║  Always Watching. Never Sleeping.         ║");
     info!("╚══════════════════════════════════════════╝");
-    info!("Node:   {}", cfg.sentinel.name);
-    info!("API:    http://0.0.0.0:{} (auth: {})", cfg.sentinel.api_port,
-        if cfg.sentinel.api_key.is_empty() { "disabled ⚠️" } else { "X-Sentinel-Key ✅" });
-    info!("Gossip: 0.0.0.0:{} | {} peers | HMAC: {}",
-        cfg.gossip.port, cfg.gossip.peers.len(),
-        if cfg.gossip.shared_secret.contains("CHANGE_ME") { "default ⚠️" } else { "custom ✅" });
+    info!("API:     http://0.0.0.0:{} | Metrics: /metrics", cfg.sentinel.api_port);
+    info!("Storage: {} | encrypted: {} | backup: {}s",
+        cfg.sentinel.data_dir, cfg.storage.encrypt_db, cfg.storage.backup_interval_secs);
 
-    let store = store::HtlcStore::open(&cfg.sentinel.data_dir)?;
+    let store = store::HtlcStore::open(&cfg.sentinel.data_dir, cfg.encryption_secret().as_deref())?;
     let stats = store.stats()?;
+    metrics::get().htlcs_watching.set(stats.watching as f64);
     info!("Store: {} HTLCs | {} defended | {} bounties pending",
         stats.total, stats.defended, stats.bounties_pending);
 
@@ -105,113 +83,81 @@ async fn main() -> Result<()> {
 
     let lnd_client = lnd::LndClient::new(&cfg.lnd)?;
     match lnd_client.get_info().await {
-        Ok(info) => {
-            info!("LND: {} ({})", info.alias, &info.identity_pubkey[..16]);
-            if !info.synced_to_chain { warn!("⚠️  LND not synced to chain"); }
-        }
-        Err(e) => warn!("⚠️  LND unreachable: {e} — bounty payments disabled"),
+        Ok(i) => { info!("LND: {} ({})", i.alias, &i.identity_pubkey[..16]); }
+        Err(e) => warn!("⚠️  LND: {e}"),
     }
 
-    // ── Graceful shutdown token ──────────────────────────────────────────────
     let cancel = CancellationToken::new();
 
-    // ── Channels ─────────────────────────────────────────────────────────────
     let (mempool_tx, mempool_rx) = mpsc::channel::<watcher::MempoolEvent>(1024);
     let (defense_tx, defense_rx) = mpsc::channel::<defense::DefenseResult>(256);
     let (gossip_bcast, _) = broadcast::channel::<gossip::GossipMessage>(256);
-    let gossip_rx_client = gossip_bcast.subscribe();
+    let gossip_rx2 = gossip_bcast.subscribe();
 
-    // ── Task helpers ─────────────────────────────────────────────────────────
-    macro_rules! spawn_cancellable {
-        ($name:expr, $cancel:expr, $fut:expr) => {{
+    macro_rules! task {
+        ($name:expr, $cancel:expr, $body:expr) => {{
             let c = $cancel.clone();
             tokio::spawn(async move {
                 tokio::select! {
-                    res = $fut => {
-                        if let Err(e) = res { error!("{} crashed: {e}", $name); }
-                    }
-                    _ = c.cancelled() => {
-                        info!("{} shutting down gracefully", $name);
-                    }
+                    r = $body => { if let Err(e) = r { error!("{}: {e}", $name); } }
+                    _ = c.cancelled() => { info!("{} stopped", $name); }
                 }
             })
         }};
     }
 
-    // Task 1 — Mempool watcher
-    let t1 = {
-        let w = watcher::MempoolWatcher::new(
-            cfg.bitcoin.clone(), store.clone(), mempool_tx,
-        )?;
-        spawn_cancellable!("Watcher", cancel, async move { w.run().await })
+    // Clone all config values before moving into tasks
+    let (btc1, btc2)   = (cfg.bitcoin.clone(), cfg.bitcoin.clone());
+    let (def1, def2)   = (cfg.defense.clone(), cfg.defense.clone());
+    let (store1, store2, store3, store4, store5, store6) = (
+        store.clone(), store.clone(), store.clone(),
+        store.clone(), store.clone(), store.clone(),
+    );
+    let (pk1, pk2, pk3) = (cfg.lnd.node_pubkey.clone(), cfg.lnd.node_pubkey.clone(), cfg.lnd.node_pubkey.clone());
+    let (sec1, sec2)   = (cfg.gossip.shared_secret.clone(), cfg.gossip.shared_secret.clone());
+    let (peers, addr)  = (cfg.gossip.peers.clone(), cfg.sentinel.advertised_addr.clone());
+    let (port_api, api_key) = (cfg.sentinel.api_port, cfg.sentinel.api_key.clone());
+    let gossip_port    = cfg.gossip.port;
+    let bcast_interval = cfg.gossip.broadcast_interval_secs;
+
+    let t1 = task!("Watcher",      cancel, async move {
+        watcher::MempoolWatcher::new(btc1, store1, mempool_tx)?.run().await
+    });
+    let t2 = task!("Defense",      cancel, async move {
+        defense::DefenseEngine::new(btc2, def1, store2, mempool_rx, defense_tx)?.run().await
+    });
+    let t3 = task!("Bounty",       cancel, async move {
+        bounty::BountyProcessor::new(def2, store3, lnd_client, rpc.clone(), defense_rx, pk1).run().await
+    });
+    let t4 = task!("GossipServer", cancel, async move {
+        gossip::GossipServer::new(gossip_port, store4, pk2, sec1, gossip_bcast.clone()).run().await
+    });
+    let t5 = task!("GossipClient", cancel, async move {
+        gossip::GossipClient::new(peers, pk3, addr, sec2, store5, bcast_interval, gossip_rx2).run().await
+    });
+    let t6 = task!("API",          cancel, async move {
+        api::ApiServer::new(port_api, store6, api_key).run().await
+    });
+
+    // Fix 11: backup task
+    let t7 = if cfg.storage.backup_interval_secs > 0 {
+        let s = store.clone(); let d = cfg.sentinel.data_dir.clone();
+        let i = cfg.storage.backup_interval_secs; let c2 = cancel.clone();
+        tokio::spawn(async move { backup::backup_loop(s, d, i, c2).await; })
+    } else {
+        tokio::spawn(async {})
     };
 
-    // Task 2 — Defense engine
-    let t2 = {
-        let mut engine = defense::DefenseEngine::new(
-            cfg.bitcoin.clone(), cfg.defense.clone(),
-            store.clone(), mempool_rx, defense_tx,
-        )?;
-        spawn_cancellable!("Defense", cancel, async move { engine.run().await })
-    };
+    info!("🟢 SentinelNet online — {} total tasks", 7);
+    info!("   POST /register  GET /status  GET /metrics  GET /htlcs");
 
-    // Task 3 — Bounty processor
-    let t3 = {
-        let mut bp = bounty::BountyProcessor::new(
-            cfg.defense.clone(), store.clone(), lnd_client,
-            rpc.clone(), defense_rx, cfg.lnd.node_pubkey.clone(),
-        );
-        spawn_cancellable!("Bounty", cancel, async move { bp.run().await })
-    };
-
-    // Task 4 — Gossip server
-    let t4 = {
-        let server = gossip::GossipServer::new(
-            cfg.gossip.port, store.clone(),
-            cfg.lnd.node_pubkey.clone(),
-            cfg.gossip.shared_secret.clone(),
-            gossip_bcast.clone(),
-        );
-        spawn_cancellable!("GossipServer", cancel, async move { server.run().await })
-    };
-
-    // Task 5 — Gossip client
-    let t5 = {
-        let client = gossip::GossipClient::new(
-            cfg.gossip.peers.clone(),
-            cfg.lnd.node_pubkey.clone(),
-            cfg.sentinel.advertised_addr.clone(),
-            cfg.gossip.shared_secret.clone(),
-            store.clone(),
-            cfg.gossip.broadcast_interval_secs,
-            gossip_rx_client,
-        );
-        spawn_cancellable!("GossipClient", cancel, async move { client.run().await })
-    };
-
-    // Task 6 — API server
-    let t6 = {
-        let server = api::ApiServer::new(
-            cfg.sentinel.api_port, store.clone(), cfg.sentinel.api_key.clone(),
-        );
-        spawn_cancellable!("API", cancel, async move { server.run().await })
-    };
-
-    info!("🟢 SentinelNet online");
-    info!("   POST http://0.0.0.0:{}/register  (X-Sentinel-Key: <key>)", cfg.sentinel.api_port);
-    info!("   GET  http://0.0.0.0:{}/status", cfg.sentinel.api_port);
-
-    // ── Wait for Ctrl-C, then cancel all tasks ───────────────────────────────
     tokio::signal::ctrl_c().await?;
-    info!("Ctrl-C received — shutting down all tasks…");
+    info!("Ctrl-C — graceful shutdown (5s drain)…");
     cancel.cancel();
-
-    // Give tasks 5 s to finish gracefully
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        async { let _ = tokio::join!(t1, t2, t3, t4, t5, t6); },
+        async { let _ = tokio::join!(t1,t2,t3,t4,t5,t6,t7); },
     ).await.ok();
-
     info!("✅ Clean shutdown");
     Ok(())
 }
